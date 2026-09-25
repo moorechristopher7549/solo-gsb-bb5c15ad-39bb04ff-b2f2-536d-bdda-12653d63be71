@@ -34,7 +34,17 @@ from anyio.to_thread import run_sync
 from fastapi import FastAPI, Header, HTTPException, Query, Request, Response
 from fastapi.responses import RedirectResponse
 
-from . import claims, db, idempotency, integrity, ranges, schemas, settings, storage
+from . import (
+    claims,
+    db,
+    idempotency,
+    integrity,
+    ranges,
+    recovery,
+    schemas,
+    settings,
+    storage,
+)
 from .cleanup import start_janitor
 from .locks import session_locks
 
@@ -156,6 +166,10 @@ def _record_chunk_event(
 async def lifespan(app: FastAPI):
     storage.ensure_dirs()
     db.init_db()
+    # 先恢复崩溃的原位修复，再启动后台清理与对外服务：备份在恢复前
+    # 不允许被定时清理删除；恢复失败（保留备份）直接抛出，uvicorn 启动
+    # 中止，服务不会带着“已登记区间缺文件”的状态接收请求。
+    recovery.recover_pending_repairs()
     _, stop_event = start_janitor()
     try:
         yield

@@ -98,6 +98,28 @@ def sweep_expired_claims(now: storage.datetime | None = None) -> int:
     return cur.rowcount
 
 
+def _protected_repair_backups() -> frozenset[tuple[str, int, int]]:
+    """计算**仍需启动恢复**、定时清理绝不允许删除的修复备份集合。
+
+    键为 (session_id, start_offset, end_offset)，与磁盘备份文件名
+    ``parts/<sid>/.<start>-<end>.repairbak`` 一一对应。口径与
+    app.recovery.recover_pending_repairs 的恢复条件完全一致：
+    会话仍为 uploading 且区间在 chunks 表中有精确登记——该备份是
+    这条已登记分片旧内容的唯一副本。启动恢复成功后这种备份即不存在；
+    若启动恢复失败，服务根本不会进入接收请求/运行后台清理的阶段，
+    因此这里查到的集合只可能为空（防御性兜底：即便备份意外残留，
+    清理也宁可保留磁盘，绝不制造“已登记区间缺文件”）。
+    """
+    conn = db.get_conn()
+    rows = conn.execute(
+        "SELECT c.session_id, c.start_offset, c.end_offset "
+        "FROM chunks AS c "
+        "JOIN upload_sessions AS s ON s.id = c.session_id "
+        "WHERE s.status = 'uploading'"
+    ).fetchall()
+    return frozenset((r["session_id"], r["start_offset"], r["end_offset"]) for r in rows)
+
+
 def run_cleanup(now: storage.datetime | None = None) -> list[str]:
     """执行一轮完整清理，返回被过期的会话 id（供测试调用）。"""
     storage.ensure_dirs()
@@ -108,8 +130,11 @@ def run_cleanup(now: storage.datetime | None = None) -> list[str]:
         (now or storage.utcnow()) - timedelta(hours=1)
     )
     # 原位修复崩溃可能残留的旧分片备份（正常成功/失败路径都会立即回收）。
+    # 仍需启动恢复（uploading 会话 + chunks 表精确区间）的备份是旧内容
+    # 唯一副本，无论多旧都受保护；只有无需恢复的残留才按时长回收。
     storage.sweep_repair_backups(
-        (now or storage.utcnow()) - timedelta(hours=1)
+        (now or storage.utcnow()) - timedelta(hours=1),
+        protected=_protected_repair_backups(),
     )
     return expired
 

@@ -365,7 +365,7 @@ def test_repair_works_even_when_old_part_missing_on_disk(client: TestClient) -> 
     _complete_ok(client, sid, data)
 
 
-def test_janitor_sweeps_stale_repair_backups(client: TestClient) -> None:
+def test_janitor_never_sweeps_backup_for_registered_range(client: TestClient) -> None:
     import os
     import time as _time
     from app.cleanup import run_cleanup
@@ -373,15 +373,26 @@ def test_janitor_sweeps_stale_repair_backups(client: TestClient) -> None:
     data = b"s" * 200
     sid = _create(client, data)
     _put(client, sid, 0, 200, data).raise_for_status()
+    final = storage.part_path(sid, 0, 200)
     backup = storage.part_repair_backup_path(sid, 0, 200)
-    backup.write_bytes(b"old")
-    # 不足 1 小时：保留。
+    # 模拟崩溃：正式分片已改名备份（区间 [0,200) 仍精确登记在案）。
+    final.replace(backup)
+
+    # 无论多新或多旧，定时清理都不得删除仍需启动恢复的备份：
+    # 它是该已登记区间旧内容的唯一副本。
     run_cleanup()
     assert backup.exists()
-    # 模拟崩溃后长期残留：mtime 拨到 2 小时前，下一轮清理应删除。
     old_ts = _time.time() - 2 * 3600
     os.utime(backup, (old_ts, old_ts))
     run_cleanup()
+    assert backup.exists()
+    assert not final.exists()
+
+    # 启动恢复后备份才被使用并消失，旧内容回到正式分片路径。
+    from app.recovery import recover_pending_repairs
+
+    recover_pending_repairs()
+    assert final.read_bytes() == data
     assert not backup.exists()
 
 

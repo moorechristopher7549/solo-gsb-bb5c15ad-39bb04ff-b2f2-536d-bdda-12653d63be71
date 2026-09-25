@@ -8,7 +8,7 @@ import shutil
 import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Iterable, Iterator, Sequence
 
 from . import settings
 
@@ -57,6 +57,10 @@ def part_path(session_id: str, start: int, end: int) -> Path:
     return parts_dir(session_id) / f"{start}-{end}"
 
 
+# 原位修复备份的文件名后缀与隐藏文件模板（"." 前缀使其不被拼装读取）。
+REPAIR_BACKUP_SUFFIX = ".repairbak"
+
+
 def part_repair_backup_path(session_id: str, start: int, end: int) -> Path:
     """已收分片原位修复期间旧分片的同目录备份路径。
 
@@ -64,8 +68,44 @@ def part_repair_backup_path(session_id: str, start: int, end: int) -> Path:
     目录内 rename，全程原子；会话锁保证同一会话同时只有一个修复，
     固定名称不会冲突。它以点号开头，拼装时只按 chunks 表取
     ``<start>-<end>`` 正式分片，备份永远不会被读入成品。
+
+    崩溃后若备份仍残留，说明该次修复未走完确认阶段：服务重启时由
+    :func:`app.recovery.recover_pending_repairs` 在会话锁下用它恢复正式
+    分片（即使正式路径已落入未确认的新文件也以旧备份为准），恢复成功后
+    才删除；恢复期间它是不可再生的唯一旧内容副本，后台清理绝不删除
+    仍需恢复的备份。
     """
-    return parts_dir(session_id) / f".{start}-{end}.repairbak"
+    return parts_dir(session_id) / f".{start}-{end}{REPAIR_BACKUP_SUFFIX}"
+
+
+def iter_repair_backups() -> Iterator[tuple[str, int, int, Path]]:
+    """枚举磁盘上所有修复备份，产出 (session_id, start, end, path)。
+
+    仅接受形如 ``parts/<session_id>/.<start>-<end>.repairbak`` 且
+    start/end 为非负整数（end > start）的条目；名称无法解析的点文件
+    不是修复备份（可能是外部写入物），跳过不管，绝不臆测区间。
+    """
+    parts_root = settings.data_dir / "parts"
+    if not parts_root.exists():
+        return
+    for session_dir in parts_root.iterdir():
+        if not session_dir.is_dir():
+            continue
+        for entry in sorted(session_dir.iterdir()):
+            name = entry.name
+            if not name.startswith(".") or not name.endswith(REPAIR_BACKUP_SUFFIX):
+                continue
+            middle = name[1 : -len(REPAIR_BACKUP_SUFFIX)]
+            sep = middle.find("-")
+            if sep <= 0 or sep == len(middle) - 1:
+                continue
+            start_raw, end_raw = middle[:sep], middle[sep + 1 :]
+            if not start_raw.isdigit() or not end_raw.isdigit():
+                continue
+            start, end = int(start_raw), int(end_raw)
+            if end <= start:
+                continue
+            yield session_dir.name, start, end, entry
 
 
 def artifact_path(session_id: str) -> Path:
@@ -112,18 +152,24 @@ def sweep_old_tempfiles(older_than: datetime) -> None:
                 pass
 
 
-def sweep_repair_backups(older_than: datetime) -> None:
+def sweep_repair_backups(
+    older_than: datetime, protected: frozenset[tuple[str, int, int]] | None = None
+) -> None:
     """删除分片目录中崩溃残留的修复备份（.repairbak，正常路径会立即回收）。
 
     备份文件不参与拼装（拼装只按 chunks 表取正式分片名），残留无害；
-    这里只负责回收磁盘空间。仍处于上传中的会话目录也会被清扫：能残留
-    超过时长只可能来自进程崩溃，而不是进行中的修复（修复持有会话锁且
-    持续时间以秒计）。
+    这里只负责回收磁盘空间。``protected`` 给出**仍需启动恢复**的备份
+    （(session_id, start, end) 三元组）：这些备份是已登记区间旧内容的
+    唯一副本，无论多旧都绝不删除——恢复在服务启动时完成，后台清理
+    先于恢复运行（或恢复失败后服务未对外服务）也不能让它缺文件。
+    只有无需恢复的残留（会话已完成/已过期/不存在，或区间已不在
+    chunks 表中）才按时长回收：能残留超过时长只可能来自进程崩溃，
+    而不是进行中的修复（修复持有会话锁且持续时间以秒计）。
     """
-    parts_root = settings.data_dir / "parts"
-    if not parts_root.exists():
-        return
-    for entry in parts_root.glob("*/.*.repairbak"):
+    protected = protected if protected is not None else frozenset()
+    for session_id, start, end, entry in iter_repair_backups():
+        if (session_id, start, end) in protected:
+            continue
         try:
             mtime = datetime.fromtimestamp(entry.stat().st_mtime, tz=timezone.utc)
         except FileNotFoundError:
