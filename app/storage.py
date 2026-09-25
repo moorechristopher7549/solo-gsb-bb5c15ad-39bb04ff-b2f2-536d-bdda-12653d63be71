@@ -68,6 +68,32 @@ def part_repair_backup_path(session_id: str, start: int, end: int) -> Path:
     return parts_dir(session_id) / f".{start}-{end}.repairbak"
 
 
+_REPAIR_BACKUP_RE = re.compile(r"\.(\d+)-(\d+)\.repairbak$")
+
+
+def parse_repair_backup(path: Path) -> tuple[str, int, int] | None:
+    """把 ``.repairbak`` 备份路径解析为 (session_id, start, end)。
+
+    只接受本模块生成的固定形态 ``parts/<session_id>/.<start>-<end>.repairbak``；
+    无法按形态解析（例如其他点文件）返回 None，由调用方忽略。
+    """
+    match = _REPAIR_BACKUP_RE.search(path.name)
+    if match is None:
+        return None
+    session_id = path.parent.name
+    if not session_id or session_id in (".", ".."):
+        return None
+    return session_id, int(match.group(1)), int(match.group(2))
+
+
+def iter_repair_backups() -> list[Path]:
+    """列出磁盘上所有修复备份文件（``parts/<session_id>/.*.repairbak``）。"""
+    parts_root = settings.data_dir / "parts"
+    if not parts_root.exists():
+        return []
+    return [p for p in parts_root.glob("*/.*.repairbak") if p.is_file()]
+
+
 def artifact_path(session_id: str) -> Path:
     return files_dir() / session_id
 
@@ -112,23 +138,27 @@ def sweep_old_tempfiles(older_than: datetime) -> None:
                 pass
 
 
-def sweep_repair_backups(older_than: datetime) -> None:
+def sweep_repair_backups(
+    older_than: datetime, protected: Iterable[Path] = ()
+) -> None:
     """删除分片目录中崩溃残留的修复备份（.repairbak，正常路径会立即回收）。
 
     备份文件不参与拼装（拼装只按 chunks 表取正式分片名），残留无害；
-    这里只负责回收磁盘空间。仍处于上传中的会话目录也会被清扫：能残留
-    超过时长只可能来自进程崩溃，而不是进行中的修复（修复持有会话锁且
-    持续时间以秒计）。
+    这里只负责回收磁盘空间。``protected`` 中的备份（经数据库核对仍需
+    在启动时恢复、或属于正在上传会话的备份）**一律跳过，无视存活时长**，
+    定时清理绝不能删掉恢复所需的旧分片内容。其余备份只可能来自已结束
+    （完成/放弃/过期）会话或进行中修复——后者持有会话锁且持续时间以秒计，
+    按存活时长过滤即可；前者则在等待人工/下轮启动恢复期间继续保留。
     """
-    parts_root = settings.data_dir / "parts"
-    if not parts_root.exists():
-        return
-    for entry in parts_root.glob("*/.*.repairbak"):
+    protected_set = {Path(p) for p in protected}
+    for entry in iter_repair_backups():
+        if entry in protected_set:
+            continue
         try:
             mtime = datetime.fromtimestamp(entry.stat().st_mtime, tz=timezone.utc)
         except FileNotFoundError:
             continue
-        if mtime < older_than and entry.is_file():
+        if mtime < older_than:
             try:
                 entry.unlink()
             except FileNotFoundError:

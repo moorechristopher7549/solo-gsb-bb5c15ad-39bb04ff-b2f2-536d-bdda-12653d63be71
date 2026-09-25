@@ -34,7 +34,7 @@ from anyio.to_thread import run_sync
 from fastapi import FastAPI, Header, HTTPException, Query, Request, Response
 from fastapi.responses import RedirectResponse
 
-from . import claims, db, idempotency, integrity, ranges, schemas, settings, storage
+from . import claims, db, idempotency, integrity, ranges, recovery, schemas, settings, storage
 from .cleanup import start_janitor
 from .locks import session_locks
 
@@ -156,6 +156,10 @@ def _record_chunk_event(
 async def lifespan(app: FastAPI):
     storage.ensure_dirs()
     db.init_db()
+    # 开始接收请求前先完成原位修复的崩溃恢复：残留 .repairbak 按数据库
+    # 精确分片区间在会话锁内回滚为正式分片。恢复失败会抛出异常中止
+    # 启动（fail-closed），绝不带错对外服务。
+    recovery.recover_pending_repairs()
     _, stop_event = start_janitor()
     try:
         yield

@@ -365,7 +365,11 @@ def test_repair_works_even_when_old_part_missing_on_disk(client: TestClient) -> 
     _complete_ok(client, sid, data)
 
 
-def test_janitor_sweeps_stale_repair_backups(client: TestClient) -> None:
+def test_janitor_never_sweeps_backups_still_needed_for_recovery(
+    client: TestClient,
+) -> None:
+    """定时清理不得删除仍需启动恢复的备份：uploading 会话 + chunks 表中
+    存在精确一致的分片区间时，无论多旧都保留；不受保护的备份才按时长回收。"""
     import os
     import time as _time
     from app.cleanup import run_cleanup
@@ -374,15 +378,58 @@ def test_janitor_sweeps_stale_repair_backups(client: TestClient) -> None:
     sid = _create(client, data)
     _put(client, sid, 0, 200, data).raise_for_status()
     backup = storage.part_repair_backup_path(sid, 0, 200)
-    backup.write_bytes(b"old")
+    # 长度与登记区间一致的合法备份（内容另写一份即可），模拟崩溃残留。
+    backup.write_bytes(b"t" * 200)
+
     # 不足 1 小时：保留。
     run_cleanup()
     assert backup.exists()
-    # 模拟崩溃后长期残留：mtime 拨到 2 小时前，下一轮清理应删除。
+    # 模拟崩溃后长期残留：mtime 拨到 2 小时前——备份与数据库中的精确分片
+    # 区间对应且会话仍上传中，定时清理必须继续保留，等待下次启动恢复。
+    old_ts = _time.time() - 2 * 3600
+    os.utime(backup, (old_ts, old_ts))
+    run_cleanup()
+    assert backup.exists()
+
+    # 文件名无法对应任何已登记精确区间的备份不受保护（例如区间不符），
+    # 超过 1 小时照常回收。
+    stray = storage.parts_dir(sid) / ".0-100.repairbak"
+    stray.write_bytes(b"x" * 100)
+    os.utime(stray, (old_ts, old_ts))
+    run_cleanup()
+    assert not stray.exists()
+    # 受保护备份不受影响。
+    assert backup.exists()
+    # 清理人为残留，避免污染共享测试数据目录（内容为占位字节）。
+    backup.unlink()
+
+
+def test_janitor_sweeps_stale_backups_of_finished_sessions(
+    client: TestClient,
+) -> None:
+    """已完成会话分片目录里若残留备份（不受恢复保护），超时后照常回收。"""
+    import os
+    import time as _time
+    from app.cleanup import run_cleanup
+
+    data = b"s" * 200
+    sid = _create(client, data)
+    _put(client, sid, 0, 200, data).raise_for_status()
+    _complete_ok(client, sid, data)
+
+    # 完成后主流程会删除分片目录；手动模拟一个残留备份。
+    d = storage.parts_dir(sid)
+    d.mkdir(parents=True, exist_ok=True)
+    backup = d / ".0-200.repairbak"
+    backup.write_bytes(b"old")
     old_ts = _time.time() - 2 * 3600
     os.utime(backup, (old_ts, old_ts))
     run_cleanup()
     assert not backup.exists()
+    # 兜底清理：即便断言失败也不留空目录/残留影响其他用例。
+    import shutil
+
+    shutil.rmtree(d, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------

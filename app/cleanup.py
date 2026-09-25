@@ -4,7 +4,7 @@ from __future__ import annotations
 import threading
 from datetime import timedelta
 
-from . import db, settings, storage
+from . import db, recovery, settings, storage
 from .locks import session_locks
 
 
@@ -108,8 +108,11 @@ def run_cleanup(now: storage.datetime | None = None) -> list[str]:
         (now or storage.utcnow()) - timedelta(hours=1)
     )
     # 原位修复崩溃可能残留的旧分片备份（正常成功/失败路径都会立即回收）。
+    # 仍需启动恢复（uploading 会话 + 数据库存在精确分片区间）的备份无论
+    # 多旧都受保护，绝不删除——否则已登记区间会缺文件或原内容永久丢失。
     storage.sweep_repair_backups(
-        (now or storage.utcnow()) - timedelta(hours=1)
+        (now or storage.utcnow()) - timedelta(hours=1),
+        protected=recovery.pending_recovery_backups(),
     )
     return expired
 
